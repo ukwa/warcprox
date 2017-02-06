@@ -1,23 +1,43 @@
-# vim: set sw=4 et:
-#
-# tox approach stolen from
-# https://github.com/pypa/pip/blob/abdb597dbfb51b21cc76c1cff068b72c80f3a77d/.travis.yml
-#
-
 language: python
+python:
+- 3.6
+- 3.5
+- 3.4
+- 2.7
+- pypy
+- pypy3
+- 3.7-dev
+- nightly
 
-env:
-    - TOXENV=py27
-    - TOXENV=py32
-    - TOXENV=py33
-    - TOXENV=py34
+matrix:
+  allow_failures:
+  - python: pypy3
+  - python: nightly
+  - python: 3.7-dev
+
+addons:
+  apt:
+    packages:
+    - python-gdbm
+    - python3-gdbm
+    - tor
+
+services:
+- docker
 
 before_install:
-    - sudo apt-get update
-    - sudo apt-get -y install python-gdbm python3-gdbm
+- sudo service docker restart ; sleep 10  # https://github.com/travis-ci/travis-ci/issues/4778
+- docker run -d --publish=28015:28015 rethinkdb
 
 before_script:
-    - pip install tox
+- pip install . pytest requests
 
-script: tox
+script:
+- py.test -v -s tests
+- py.test -v -s --rethinkdb-servers=localhost tests tests
+- py.test -v -s --rethinkdb-servers=localhost --rethinkdb-big-table tests
 
+notifications:
+  slack:
+    secure: UJzNe+kEJ8QhNxrdqObroisJAO2ipr+Sr2+u1e2euQdIkacyX+nZ88jSk6uDKniAemSfFDI8Ty5a7++2wSbE//Hr3jOSNOJMZLzockafzvIYrq9bP7V97j1gQ4u7liWd19VBnbf0pULuwEfy/n5PdOBR/TiPrgMuYjfZseV+alo=
+    secure: S1SK52178uywcWLMO4S5POdjMv1MQjR061CKprjVn2d8x5RBbg8QZtumA6Xt+pByvJzh8vk+ITHCN57tcdi51yL6Z0QauXwxwzTsZmjrhxWOybAO2uOHliqQSDgxKcbXIqJKg7Yv19eLQYWDVJVGuwlMfVBS0hOHtTTpVuLuGuc=
