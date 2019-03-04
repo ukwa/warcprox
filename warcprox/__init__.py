@@ -1,7 +1,7 @@
 """
 warcprox/__init__.py - warcprox package main file, contains some utility code
 
-Copyright (C) 2013-2016 Internet Archive
+Copyright (C) 2013-2019 Internet Archive
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -19,11 +19,23 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
 USA.
 """
 
+import sys
+import datetime
+import threading
+import time
+import logging
 from argparse import Namespace as _Namespace
 from pkg_resources import get_distribution as _get_distribution
+import concurrent.futures
+try:
+    import queue
+except ImportError:
+    import Queue as queue
+import json
+
 __version__ = _get_distribution('warcprox').version
 
-def digest_str(hash_obj, base32):
+def digest_str(hash_obj, base32=False):
     import base64
     return hash_obj.name.encode('utf-8') + b':' + (
             base64.b32encode(hash_obj.digest()) if base32
@@ -35,6 +47,15 @@ class Options(_Namespace):
             return super(Options, self).__getattr__(self, name)
         except AttributeError:
             return None
+
+class Jsonner(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, datetime.datetime):
+            return o.isoformat()
+        elif isinstance(o, bytes):
+            return base64.b64encode(o).decode('ascii')
+        else:
+            return json.JSONEncoder.default(self, o)
 
 # XXX linux-specific
 def gettid():
@@ -57,76 +78,181 @@ class RequestBlockedByRule(Exception):
     def __str__(self):
         return "%s: %s" % (self.__class__.__name__, self.msg)
 
-class Url:
-    '''
-    Utility class
-    '''
-    def __init__(self, url):
-        self.url = url
-        self._surt = None
-        self._host = None
+class BasePostfetchProcessor(threading.Thread):
+    logger = logging.getLogger("warcprox.BasePostfetchProcessor")
 
-    @property
-    def surt(self):
-        if not self._surt:
-            import surt
-            hurl = surt.handyurl.parse(self.url)
-            surt.GoogleURLCanonicalizer.canonicalize(hurl)
-            hurl.query = None
-            hurl.hash = None
-            self._surt = hurl.getURLString(surt=True, trailing_comma=True)
-        return self._surt
+    def __init__(self, options=Options(), controller=None, **kwargs):
+        threading.Thread.__init__(self, name=self.__class__.__name__)
+        self.options = options
+        self.controller = controller
 
-    @property
-    def host(self):
-        if not self._host:
-            import surt
-            self._host = surt.handyurl.parse(self.url).host
-        return self._host
+        self.stop = threading.Event()
 
-    def matches_ip_or_domain(self, ip_or_domain):
-        return host_matches_ip_or_domain(self.host, ip_or_domain)
+        # these should be set by the caller before thread is started
+        self.inq = None
+        self.outq = None
+        self.profiler = None
 
-def normalize_host(host):
-    # normalize host (punycode and lowercase)
-    return host.encode('idna').decode('ascii').lower()
+    def run(self):
+        try:
+            if self.options.profile:
+                import cProfile
+                self.profiler = cProfile.Profile()
+                self.profiler.enable()
+                self._run()
+                self.profiler.disable()
+            else:
+                self._run()
+        except:
+            self.logger.critical(
+                    '%s dying due to uncaught exception',
+                    self.name, exc_info=True)
 
-def host_matches_ip_or_domain(host, ip_or_domain):
-    '''
-    Returns true if
-     - ip_or_domain is an ip address and host is the same ip address
-     - ip_or_domain is a domain and host is the same domain
-     - ip_or_domain is a domain and host is a subdomain of it
-    '''
-    _host = normalize_host(host)
-    _ip_or_domain = normalize_host(ip_or_domain)
+    def _get_process_put(self):
+        '''
+        Get url(s) from `self.inq`, process url(s), queue to `self.outq`.
 
-    if _ip_or_domain == _host:
-        return True
+        Subclasses must implement this. Implementations may operate on
+        individual urls, or on batches.
 
-    # if either _ip_or_domain or host are ip addresses, and they're not
-    # identical (previous check), not a match
-    try:
-        ipaddress.ip_address(_ip_or_domain)
-        return False
-    except:
+        May raise queue.Empty.
+        '''
+        raise Exception('not implemented')
+
+    def _run(self):
+        threading.current_thread().name = '%s(tid=%s)' % (
+                threading.current_thread().name, gettid())
+        self.logger.info('%s starting up', self)
+        self._startup()
+        while not self.stop.is_set():
+            try:
+                while True:
+                    try:
+                        self._get_process_put()
+                    except queue.Empty:
+                        if self.stop.is_set():
+                            break
+                self.logger.info('%s shutting down', self)
+                self._shutdown()
+            except Exception as e:
+                if isinstance(e, OSError) and e.errno == 28:
+                    # OSError: [Errno 28] No space left on device
+                    self.logger.critical(
+                            'shutting down due to fatal problem: %s: %s',
+                            e.__class__.__name__, e)
+                    self._shutdown()
+                    sys.exit(1)
+
+                self.logger.critical(
+                    '%s will try to continue after unexpected error',
+                    self.name, exc_info=True)
+                time.sleep(0.5)
+
+    def _startup(self):
         pass
-    try:
-        ipaddress.ip_address(_host)
-        return False
-    except:
+
+    def _shutdown(self):
         pass
 
-    # if we get here, we're looking at two hostnames
-    domain_parts = _ip_or_domain.split(".")
-    host_parts = _host.split(".")
+class BaseStandardPostfetchProcessor(BasePostfetchProcessor):
+    def _get_process_put(self):
+        recorded_url = self.inq.get(block=True, timeout=0.5)
+        self._process_url(recorded_url)
+        if self.outq:
+            self.outq.put(recorded_url)
 
-    result = host_parts[-len(domain_parts):] == domain_parts
-    return result
+    def _process_url(self, recorded_url):
+        raise Exception('not implemented')
 
+class BaseBatchPostfetchProcessor(BasePostfetchProcessor):
+    MAX_BATCH_SIZE = 500
+    MAX_BATCH_SEC = 10
+    MIN_BATCH_SEC = 2.0
 
-# logging level more fine-grained than logging.DEBUG==10
-TRACE = 5
+    def _get_process_put(self):
+        batch = []
+        start = time.time()
+
+        while True:
+            try:
+                batch.append(self.inq.get(block=True, timeout=0.5))
+            except queue.Empty:
+                if self.stop.is_set():
+                    break
+                # else maybe keep adding to the batch
+
+            if len(batch) >= self.MAX_BATCH_SIZE:
+                break  # full batch
+
+            elapsed = time.time() - start
+            if elapsed >= self.MAX_BATCH_SEC:
+                break  # been batching for a while
+
+            if (elapsed >= self.MIN_BATCH_SEC and self.outq
+                    and len(self.outq.queue) == 0):
+                break  # next processor is waiting on us
+
+        if not batch:
+            raise queue.Empty
+
+        self.logger.info(
+                'gathered batch of %s in %0.2f sec',
+                len(batch), time.time() - start)
+        self._process_batch(batch)
+
+        if self.outq:
+            for recorded_url in batch:
+                self.outq.put(recorded_url)
+
+    def _process_batch(self, batch):
+        raise Exception('not implemented')
+
+class ListenerPostfetchProcessor(BaseStandardPostfetchProcessor):
+    def __init__(self, listener, options=Options(), controller=None, **kwargs):
+        BaseStandardPostfetchProcessor.__init__(self, options, controller, **kwargs)
+        self.listener = listener
+        self.name = listener.__class__.__name__
+
+    def _process_url(self, recorded_url):
+        return self.listener.notify(recorded_url, recorded_url.warc_records)
+
+    def start(self):
+        if hasattr(self.listener, 'start'):
+            self.listener.start()
+        BaseStandardPostfetchProcessor.start(self)
+
+    def _shutdown(self):
+        if hasattr(self.listener, 'stop'):
+            try:
+                self.listener.stop()
+            except:
+                self.logger.error(
+                        '%s raised exception', self.listener.stop, exc_info=True)
+
+def timestamp17():
+    now = datetime.datetime.utcnow()
+    return '{:%Y%m%d%H%M%S}{:03d}'.format(now, now.microsecond//1000)
+
+def timestamp14():
+    now = datetime.datetime.utcnow()
+    return '{:%Y%m%d%H%M%S}'.format(now)
+
+# monkey-patch log levels TRACE and NOTICE
+logging.TRACE = (logging.NOTSET + logging.DEBUG) // 2
+def _logger_trace(self, msg, *args, **kwargs):
+    if self.isEnabledFor(logging.TRACE):
+        self._log(logging.TRACE, msg, args, **kwargs)
+logging.Logger.trace = _logger_trace
+logging.trace = logging.root.trace
+logging.addLevelName(logging.TRACE, 'TRACE')
+
+logging.NOTICE = (logging.INFO + logging.WARN) // 2
+def _logger_notice(self, msg, *args, **kwargs):
+    if self.isEnabledFor(logging.NOTICE):
+        self._log(logging.NOTICE, msg, args, **kwargs)
+logging.Logger.notice = _logger_notice
+logging.notice = logging.root.notice
+logging.addLevelName(logging.NOTICE, 'NOTICE')
 
 import warcprox.controller as controller
 import warcprox.playback as playback
@@ -138,4 +264,4 @@ import warcprox.warc as warc
 import warcprox.writerthread as writerthread
 import warcprox.stats as stats
 import warcprox.bigtable as bigtable
-import warcprox.kafkafeed as kafkafeed
+import warcprox.crawl_log as crawl_log

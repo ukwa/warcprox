@@ -1,25 +1,23 @@
-#
-# warcprox/warc.py - assembles warc records
-#
-# Copyright (C) 2013-2016 Internet Archive
-#
-# This program is free software; you can redistribute it and/or
-# modify it under the terms of the GNU General Public License
-# as published by the Free Software Foundation; either version 2
-# of the License, or (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with this program; if not, write to the Free Software
-# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
-# USA.
-#
+'''
+warcprox/warc.py - assembles warc records
 
-from __future__ import absolute_import
+Copyright (C) 2013-2018 Internet Archive
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation; either version 2
+of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301,
+USA.
+'''
 
 import logging
 import warcprox
@@ -27,7 +25,6 @@ import hashlib
 import socket
 import hanzo.httptools
 from hanzo import warctools
-import warcprox
 import datetime
 
 class WarcRecordBuilder:
@@ -36,6 +33,9 @@ class WarcRecordBuilder:
     def __init__(self, digest_algorithm="sha1", base32=False):
         self.digest_algorithm = digest_algorithm
         self.base32 = base32
+
+    def format_warc_date(self, dt):
+        return dt.strftime('%Y-%m-%dT%H:%M:%SZ').encode('ascii')
 
     def _build_response_principal_record(self, recorded_url, warc_date):
         """Builds response or revisit record, whichever is appropriate."""
@@ -51,10 +51,11 @@ class WarcRecordBuilder:
                     url=recorded_url.url, warc_date=warc_date,
                     data=response_header_block,
                     warc_type=warctools.WarcRecord.REVISIT,
-                    refers_to=recorded_url.dedup_info['id'],
+                    refers_to=recorded_url.dedup_info.get('id'),
                     refers_to_target_uri=recorded_url.dedup_info['url'],
                     refers_to_date=recorded_url.dedup_info['date'],
-                    payload_digest=warcprox.digest_str(recorded_url.response_recorder.payload_digest, self.base32),
+                    payload_digest=warcprox.digest_str(
+                        recorded_url.payload_digest, self.base32),
                     profile=warctools.WarcRecord.PROFILE_IDENTICAL_PAYLOAD_DIGEST,
                     content_type=hanzo.httptools.ResponseMessage.CONTENT_TYPE,
                     remote_ip=recorded_url.remote_ip)
@@ -65,11 +66,14 @@ class WarcRecordBuilder:
                     recorder=recorded_url.response_recorder,
                     warc_type=warctools.WarcRecord.RESPONSE,
                     content_type=hanzo.httptools.ResponseMessage.CONTENT_TYPE,
-                    remote_ip=recorded_url.remote_ip)
+                    remote_ip=recorded_url.remote_ip,
+                    payload_digest=warcprox.digest_str(
+                        recorded_url.payload_digest, self.base32),
+                    truncated=recorded_url.truncated)
 
     def build_warc_records(self, recorded_url):
         """Returns a tuple of hanzo.warctools.warc.WarcRecord (principal_record, ...)"""
-        warc_date = warctools.warc.warc_datetime_str(recorded_url.timestamp)
+        warc_date = self.format_warc_date(recorded_url.timestamp)
 
         if recorded_url.response_recorder:
             principal_record = self._build_response_principal_record(recorded_url, warc_date)
@@ -80,19 +84,24 @@ class WarcRecordBuilder:
                     concurrent_to=principal_record.id)
             return principal_record, request_record
         else:
-            principal_record = self.build_warc_record(url=recorded_url.url,
+            principal_record = self.build_warc_record(
+                    url=recorded_url.url,
                     warc_date=warc_date, data=recorded_url.request_data,
                     warc_type=recorded_url.custom_type,
-                    content_type=recorded_url.content_type.encode("latin1"))
+                    content_type=recorded_url.content_type.encode("latin1"),
+                    payload_digest=warcprox.digest_str(
+                        recorded_url.payload_digest, self.base32),
+                    content_length=recorded_url.size)
             return (principal_record,)
 
     def build_warc_record(self, url, warc_date=None, recorder=None, data=None,
         concurrent_to=None, warc_type=None, content_type=None, remote_ip=None,
         profile=None, refers_to=None, refers_to_target_uri=None,
-        refers_to_date=None, payload_digest=None):
+        refers_to_date=None, payload_digest=None, truncated=None,
+        content_length=None):
 
         if warc_date is None:
-            warc_date = warctools.warc.warc_datetime_str(datetime.datetime.utcnow())
+            warc_date = self.format_warc_date(datetime.datetime.utcnow())
 
         record_id = warctools.WarcRecord.random_warc_uuid()
 
@@ -118,34 +127,58 @@ class WarcRecordBuilder:
             headers.append((warctools.WarcRecord.CONTENT_TYPE, content_type))
         if payload_digest is not None:
             headers.append((warctools.WarcRecord.PAYLOAD_DIGEST, payload_digest))
+        # truncated value may be 'length' or 'time'
+        if truncated is not None:
+            headers.append((b'WARC-Truncated', truncated))
 
         if recorder is not None:
-            headers.append((warctools.WarcRecord.CONTENT_LENGTH, str(len(recorder)).encode('latin1')))
+            if content_length is not None:
+                headers.append((
+                    warctools.WarcRecord.CONTENT_LENGTH,
+                    str(content_length).encode('latin1')))
+            else:
+                headers.append((
+                    warctools.WarcRecord.CONTENT_LENGTH,
+                    str(len(recorder)).encode('latin1')))
             headers.append((warctools.WarcRecord.BLOCK_DIGEST,
                 warcprox.digest_str(recorder.block_digest, self.base32)))
-            if recorder.payload_digest is not None:
-                headers.append((warctools.WarcRecord.PAYLOAD_DIGEST,
-                    warcprox.digest_str(recorder.payload_digest, self.base32)))
-
             recorder.tempfile.seek(0)
             record = warctools.WarcRecord(headers=headers, content_file=recorder.tempfile)
-
         else:
-            headers.append((warctools.WarcRecord.CONTENT_LENGTH, str(len(data)).encode('latin1')))
-            digest = hashlib.new(self.digest_algorithm, data)
-            headers.append((warctools.WarcRecord.BLOCK_DIGEST,
-                warcprox.digest_str(digest, self.base32)))
+            if content_length is not None:
+                headers.append((
+                    warctools.WarcRecord.CONTENT_LENGTH,
+                    str(content_length).encode('latin1')))
+            else:
+                headers.append((
+                    warctools.WarcRecord.CONTENT_LENGTH,
+                    str(len(data)).encode('latin1')))
+            # no http headers so block digest == payload digest
             if not payload_digest:
-                headers.append((warctools.WarcRecord.PAYLOAD_DIGEST,
-                                warcprox.digest_str(digest, self.base32)))
-
-            content_tuple = content_type, data
-            record = warctools.WarcRecord(headers=headers, content=content_tuple)
+                payload_digest = warcprox.digest_str(
+                        hashlib.new(self.digest_algorithm, data), self.base32)
+                headers.append((
+                    warctools.WarcRecord.PAYLOAD_DIGEST, payload_digest))
+            headers.append((warctools.WarcRecord.BLOCK_DIGEST, payload_digest))
+            if hasattr(data, 'read'):
+                record = warctools.WarcRecord(
+                        headers=headers, content_file=data)
+            else:
+                content_tuple = content_type, data
+                record = warctools.WarcRecord(
+                        headers=headers, content=content_tuple)
 
         return record
 
+    def _local_address(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('10.255.255.255', 1)) # ip doesn't need to be reachable
+        output = s.getsockname()[0]
+        s.close()
+        return output
+
     def build_warcinfo_record(self, filename):
-        warc_record_date = warctools.warc.warc_datetime_str(datetime.datetime.utcnow())
+        warc_record_date = self.format_warc_date(datetime.datetime.utcnow())
         record_id = warctools.WarcRecord.random_warc_uuid()
 
         headers = []
@@ -158,7 +191,7 @@ class WarcRecordBuilder:
         warcinfo_fields.append(b'software: warcprox ' + warcprox.__version__.encode('latin1'))
         hostname = socket.gethostname()
         warcinfo_fields.append('hostname: {}'.format(hostname).encode('latin1'))
-        warcinfo_fields.append('ip: {}'.format(socket.gethostbyname(hostname)).encode('latin1'))
+        warcinfo_fields.append(('ip: %s' % self._local_address()).encode('latin1'))
         warcinfo_fields.append(b'format: WARC File Format 1.0')
         # warcinfo_fields.append('robots: ignore')
         # warcinfo_fields.append('description: {0}'.format(self.description))

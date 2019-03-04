@@ -25,28 +25,27 @@ USA.
 from __future__ import absolute_import
 
 import logging
-from hanzo import warctools
-import random
 import warcprox
 import base64
-import surt
+import urlcanon
 import os
 import hashlib
 import threading
 import datetime
-import rethinkstuff
+import doublethink
+import rethinkdb as r
+from warcprox.dedup import DedupableMixin
 
 class RethinkCaptures:
     """Inserts in batches every 0.5 seconds"""
     logger = logging.getLogger("warcprox.bigtable.RethinkCaptures")
 
-    def __init__(
-            self, r, table="captures", shards=None, replicas=None,
-            options=warcprox.Options()):
-        self.r = r
-        self.table = table
-        self.shards = shards or len(r.servers)
-        self.replicas = replicas or min(3, len(r.servers))
+    def __init__(self, options=warcprox.Options()):
+        parsed = doublethink.parse_rethinkdb_url(
+                options.rethinkdb_big_table_url)
+        self.rr = doublethink.Rethinker(
+                servers=parsed.hosts, db=parsed.database)
+        self.table = parsed.table
         self.options = options
         self._ensure_db_table()
 
@@ -64,7 +63,7 @@ class RethinkCaptures:
         try:
             with self._batch_lock:
                 if len(self._batch) > 0:
-                    result = self.r.table(self.table).insert(
+                    result = self.rr.table(self.table).insert(
                             self._batch, conflict="replace").run()
                     if (result["inserted"] + result["replaced"]
                             + result["unchanged"] != len(self._batch)):
@@ -99,61 +98,71 @@ class RethinkCaptures:
                 self.logger.info("finished")
 
     def _ensure_db_table(self):
-        dbs = self.r.db_list().run()
-        if not self.r.dbname in dbs:
-            self.logger.info("creating rethinkdb database %s", repr(self.r.dbname))
-            self.r.db_create(self.r.dbname).run()
-        tables = self.r.table_list().run()
+        dbs = self.rr.db_list().run()
+        if not self.rr.dbname in dbs:
+            self.logger.info("creating rethinkdb database %r", self.rr.dbname)
+            self.rr.db_create(self.rr.dbname).run()
+        tables = self.rr.table_list().run()
         if not self.table in tables:
-            self.logger.info("creating rethinkdb table %s in database %s", repr(self.table), repr(self.r.dbname))
-            self.r.table_create(self.table, shards=self.shards, replicas=self.replicas).run()
-            self.r.table(self.table).index_create("abbr_canon_surt_timestamp", [self.r.row["abbr_canon_surt"], self.r.row["timestamp"]]).run()
-            self.r.table(self.table).index_create("sha1_warc_type", [self.r.row["sha1base32"], self.r.row["warc_type"], self.r.row["bucket"]]).run()
+            self.logger.info(
+                    "creating rethinkdb table %r in database %r",
+                    self.table, self.rr.dbname)
+            self.rr.table_create(
+                    self.table, shards=len(self.rr.servers),
+                    replicas=min(3, len(self.rr.servers))).run()
+            self.rr.table(self.table).index_create(
+                    "abbr_canon_surt_timestamp",
+                    [r.row["abbr_canon_surt"], r.row["timestamp"]]).run()
+            self.rr.table(self.table).index_create("sha1_warc_type", [
+                r.row["sha1base32"], r.row["warc_type"], r.row["bucket"]]).run()
+            self.rr.table(self.table).index_wait().run()
 
     def find_response_by_digest(self, algo, raw_digest, bucket="__unspecified__"):
         if algo != "sha1":
             raise Exception(
-                    "digest type is %s but big captures table is indexed by "
+                    "digest type is %r but big captures table is indexed by "
                     "sha1" % algo)
         sha1base32 = base64.b32encode(raw_digest).decode("utf-8")
-        results_iter = self.r.table(self.table).get_all(
+        results_iter = self.rr.table(self.table).get_all(
                 [sha1base32, "response", bucket],
                 index="sha1_warc_type").filter(
-                        self.r.row["dedup_ok"], default=True).run()
+                        r.row["dedup_ok"], default=True).run()
         results = list(results_iter)
         if len(results) > 0:
             if len(results) > 1:
-                self.logger.debug("expected 0 or 1 but found %s results for sha1base32=%s bucket=%s (will use first result)", len(results), sha1base32, bucket)
+                self.logger.debug(
+                        "expected 0 or 1 but found %r results for "
+                        "sha1base32=%r bucket=%r (will use first result)",
+                        len(results), sha1base32, bucket)
             result = results[0]
         else:
             result = None
-        self.logger.debug("returning %s for sha1base32=%s bucket=%s",
+        self.logger.debug("returning %r for sha1base32=%r bucket=%r",
                           result, sha1base32, bucket)
         return result
 
     def _assemble_entry(self, recorded_url, records):
-        if recorded_url.response_recorder:
-            if recorded_url.response_recorder.payload_digest.name == "sha1":
+        if recorded_url.payload_digest:
+            if recorded_url.payload_digest.name == "sha1":
                 sha1base32 = base64.b32encode(
-                        recorded_url.response_recorder.payload_digest.digest()
+                        recorded_url.payload_digest.digest()
                         ).decode("utf-8")
             else:
                 self.logger.warn(
-                        "digest type is %s but big captures table is indexed "
+                        "digest type is %r but big captures table is indexed "
                         "by sha1",
-                        recorded_url.response_recorder.payload_digest.name)
+                        recorded_url.payload_digest.name)
         else:
             digest = hashlib.new("sha1", records[0].content[1])
             sha1base32 = base64.b32encode(digest.digest()).decode("utf-8")
 
         if (recorded_url.warcprox_meta
-                and "captures-bucket" in recorded_url.warcprox_meta):
-            bucket = recorded_url.warcprox_meta["captures-bucket"]
+                and "dedup-bucket" in recorded_url.warcprox_meta):
+            bucket = recorded_url.warcprox_meta["dedup-bucket"]
         else:
             bucket = "__unspecified__"
 
-        canon_surt = surt.surt(recorded_url.url.decode("utf-8"),
-            trailing_comma=True, host_massage=False, with_scheme=True)
+        canon_surt = urlcanon.semantic(recorded_url.url).surt().decode('ascii')
 
         entry = {
             # id only specified for rethinkdb partitioning
@@ -162,7 +171,7 @@ class RethinkCaptures:
             "abbr_canon_surt": canon_surt[:150],
             "canon_surt": canon_surt,
             "timestamp": recorded_url.timestamp.replace(
-                tzinfo=rethinkstuff.UTC),
+                tzinfo=doublethink.UTC),
             "url": recorded_url.url.decode("utf-8"),
             "offset": records[0].offset,
             "filename": os.path.basename(records[0].warc_filename),
@@ -193,9 +202,10 @@ class RethinkCaptures:
         return entry
 
     def notify(self, recorded_url, records):
-        entry = self._assemble_entry(recorded_url, records)
-        with self._batch_lock:
-            self._batch.append(entry)
+        if records:
+            entry = self._assemble_entry(recorded_url, records)
+            with self._batch_lock:
+                self._batch.append(entry)
 
     def close(self):
         self.stop()
@@ -206,14 +216,15 @@ class RethinkCaptures:
         if self._timer:
             self._timer.join()
 
-class RethinkCapturesDedup:
+class RethinkCapturesDedup(warcprox.dedup.DedupDb, DedupableMixin):
     logger = logging.getLogger("warcprox.dedup.RethinkCapturesDedup")
 
-    def __init__(self, captures_db, options=warcprox.Options()):
-        self.captures_db = captures_db
+    def __init__(self, options=warcprox.Options()):
+        DedupableMixin.__init__(self, options)
+        self.captures_db = RethinkCaptures(options=options)
         self.options = options
 
-    def lookup(self, digest_key, bucket="__unspecified__"):
+    def lookup(self, digest_key, bucket="__unspecified__", url=None):
         k = digest_key.decode("utf-8") if isinstance(digest_key, bytes) else digest_key
         algo, value_str = k.split(":")
         if self.options.base32:
@@ -240,3 +251,6 @@ class RethinkCapturesDedup:
 
     def close(self):
         self.captures_db.close()
+
+    def notify(self, recorded_url, records):
+        self.captures_db.notify(recorded_url, records)

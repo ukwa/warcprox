@@ -2,7 +2,7 @@
 '''
 setup.py - setuptools installation configuration for warcprox
 
-Copyright (C) 2013-2017 Internet Archive
+Copyright (C) 2013-2019 Internet Archive
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -22,27 +22,17 @@ USA.
 
 import sys
 import setuptools
-import setuptools.command.test
-
-# special class needs to be added to support the pytest written dump-anydbm tests
-class PyTest(setuptools.command.test.test):
-    def finalize_options(self):
-        setuptools.command.test.test.finalize_options(self)
-        self.test_args = []
-        self.test_suite = True
-    def run_tests(self):
-        # import here, because outside the eggs aren't loaded
-        import pytest
-        errno = pytest.main(self.test_args)
-        sys.exit(errno)
 
 deps = [
-    'certauth>=1.1.0',
-    'warctools',
-    'kafka-python>=1.0.1',
-    'surt>=0.3b4',
-    'rethinkstuff',
-    'PySocks',
+    'certauth==1.1.6',
+    'warctools>=4.10.0',
+    'urlcanon>=0.1.dev16',
+    'doublethink>=0.2.0.dev87',
+    'urllib3>=1.14',
+    'requests>=2.0.1',
+    'PySocks>=1.6.8',
+    'cryptography>=2.3',
+    'idna>=2.5',
 ]
 try:
     import concurrent.futures
@@ -51,7 +41,7 @@ except:
 
 setuptools.setup(
         name='warcprox',
-        version='2.1b1.dev50',
+        version='2.4b7.dev197',
         description='WARC writing MITM HTTP/S proxy',
         url='https://github.com/internetarchive/warcprox',
         author='Noah Levitt',
@@ -60,15 +50,13 @@ setuptools.setup(
         license='GPL',
         packages=['warcprox'],
         install_requires=deps,
-        tests_require=['requests>=2.0.1', 'pytest'],  # >=2.0.1 for https://github.com/kennethreitz/requests/pull/1636
-        cmdclass = {'test': PyTest},
-        test_suite='warcprox.tests',
+        setup_requires=['pytest-runner'],
+        tests_require=['mock', 'pytest', 'warcio'],
         entry_points={
             'console_scripts': [
                 'warcprox=warcprox.main:main',
                 ('warcprox-ensure-rethinkdb-tables='
                     'warcprox.main:ensure_rethinkdb_tables'),
-                'dump-anydbm=warcprox.dump_anydbm:main',
             ],
         },
         zip_safe=False,
@@ -76,10 +64,10 @@ setuptools.setup(
             'Development Status :: 5 - Production/Stable',
             'Environment :: Console',
             'License :: OSI Approved :: GNU General Public License (GPL)',
-            'Programming Language :: Python :: 2.7',
             'Programming Language :: Python :: 3.4',
             'Programming Language :: Python :: 3.5',
             'Programming Language :: Python :: 3.6',
+            'Programming Language :: Python :: 3.7',
             'Topic :: Internet :: Proxy Servers',
             'Topic :: Internet :: WWW/HTTP',
             'Topic :: Software Development :: Libraries :: Python Modules',

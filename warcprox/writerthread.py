@@ -2,7 +2,7 @@
 warcprox/writerthread.py - warc writer thread, reads from the recorded url
 queue, writes warc records, runs final tasks after warc records are written
 
-Copyright (C) 2013-2016 Internet Archive
+Copyright (C) 2013-2019 Internet Archive
 
 This program is free software; you can redistribute it and/or
 modify it under the terms of the GNU General Public License
@@ -28,104 +28,115 @@ except ImportError:
     import Queue as queue
 
 import logging
-import threading
-import os
-import hashlib
 import time
-import socket
-import base64
-from datetime import datetime
-import hanzo.httptools
-from hanzo import warctools
 import warcprox
-import cProfile
+from concurrent import futures
+from datetime import datetime
+import threading
+try:
+    import queue
+except ImportError:
+    import Queue as queue
 
-class WarcWriterThread(threading.Thread):
-    logger = logging.getLogger("warcprox.warcproxwriter.WarcWriterThread")
-
-    def __init__(self, recorded_url_q=None, writer_pool=None, dedup_db=None, listeners=None, options=warcprox.Options()):
-        """recorded_url_q is a queue.Queue of warcprox.warcprox.RecordedUrl."""
-        threading.Thread.__init__(self, name='WarcWriterThread')
-        self.recorded_url_q = recorded_url_q
-        self.stop = threading.Event()
-        if writer_pool:
-            self.writer_pool = writer_pool
-        else:
-            self.writer_pool = WarcWriterPool()
-        self.dedup_db = dedup_db
-        self.listeners = listeners
-        self.options = options
-        self.idle = None
-        self.method_filter = set(method.upper() for method in self.options.method_filter or [])
-
-    def run(self):
-        if self.options.profile:
-            cProfile.runctx('self._run()', globals(), locals(), sort='cumulative')
-        else:
-            self._run()
+class WarcWriterProcessor(warcprox.BaseStandardPostfetchProcessor):
+    logger = logging.getLogger("warcprox.writerthread.WarcWriterProcessor")
 
     _ALWAYS_ACCEPT = {'WARCPROX_WRITE_RECORD'}
+
+    def __init__(self, options=warcprox.Options()):
+        warcprox.BaseStandardPostfetchProcessor.__init__(self, options=options)
+        self.writer_pool = warcprox.writer.WarcWriterPool(options)
+        self.method_filter = set(method.upper() for method in self.options.method_filter or [])
+        self.blackout_period = options.blackout_period or 0
+        self.close_prefix_reqs = queue.Queue()
+
+    def _get_process_put(self):
+        while True:
+            try:
+                prefix = self.close_prefix_reqs.get_nowait()
+                self.writer_pool.close_for_prefix(prefix)
+            except queue.Empty:
+                break
+        self.writer_pool.maybe_idle_rollover()
+        super()._get_process_put()
+
+    def close_for_prefix(self, prefix=None):
+        '''
+        Request close of warc writer for the given warc prefix, or the default
+        prefix if `prefix` is `None`.
+
+        This API exists so that some code from outside of warcprox proper (in a
+        third-party plugin for example) can close open warcs promptly when it
+        knows they are finished.
+        '''
+        self.close_prefix_reqs.put(prefix)
+
+    def _process_url(self, recorded_url):
+        try:
+            records = []
+            if self._should_archive(recorded_url):
+                records = self.writer_pool.write_records(recorded_url)
+            recorded_url.warc_records = records
+            self._log(recorded_url, records)
+            # try to release resources in a timely fashion
+            if recorded_url.response_recorder and recorded_url.response_recorder.tempfile:
+                recorded_url.response_recorder.tempfile.close()
+        except:
+            logging.error(
+                    'caught exception processing %s', recorded_url.url,
+                    exc_info=True)
+
     def _filter_accepts(self, recorded_url):
         if not self.method_filter:
             return True
         meth = recorded_url.method.upper()
         return meth in self._ALWAYS_ACCEPT or meth in self.method_filter
 
-    def _run(self):
-        while not self.stop.is_set():
-            try:
-                self.name = 'WarcWriterThread(tid={})'.format(warcprox.gettid())
-                while True:
-                    try:
-                        if self.stop.is_set():
-                            qsize = self.recorded_url_q.qsize()
-                            if qsize % 50 == 0:
-                                self.logger.info("%s urls left to write", qsize)
+    # XXX optimize handling of urls not to be archived throughout warcprox
+    def _should_archive(self, recorded_url):
+        prefix = (recorded_url.warcprox_meta['warc-prefix']
+                  if recorded_url.warcprox_meta
+                     and 'warc-prefix' in recorded_url.warcprox_meta
+                  else self.options.prefix)
+        # special warc name prefix '-' means "don't archive"
+        return (prefix != '-' and not recorded_url.do_not_archive
+                and self._filter_accepts(recorded_url)
+                and not self._in_blackout(recorded_url))
 
-                        recorded_url = self.recorded_url_q.get(block=True, timeout=0.5)
-                        self.idle = None
-                        if self._filter_accepts(recorded_url):
-                            if self.dedup_db:
-                                warcprox.dedup.decorate_with_dedup_info(self.dedup_db,
-                                        recorded_url, base32=self.options.base32)
-                            records = self.writer_pool.write_records(recorded_url)
-                            self._final_tasks(recorded_url, records)
-
-                        # try to release resources in a timely fashion
-                        if recorded_url.response_recorder and recorded_url.response_recorder.tempfile:
-                            recorded_url.response_recorder.tempfile.close()
-                    except queue.Empty:
-                        if self.stop.is_set():
-                            break
-                        self.idle = time.time()
-                        self.writer_pool.maybe_idle_rollover()
-
-                self.logger.info('WarcWriterThread shutting down')
-                self.writer_pool.close_writers()
-            except:
-                self.logger.critical("WarcWriterThread will try to continue after unexpected error", exc_info=True)
-                time.sleep(0.5)
-
-    # closest thing we have to heritrix crawl log at the moment
-    def _log(self, recorded_url, records):
-        try:
-            payload_digest = records[0].get_header(warctools.WarcRecord.PAYLOAD_DIGEST).decode("utf-8")
-        except:
-            payload_digest = "-"
-
-        # 2015-07-17T22:32:23.672Z     1         58 dns:www.dhss.delaware.gov P http://www.dhss.delaware.gov/dhss/ text/dns #045 20150717223214881+316 sha1:63UTPB7GTWIHAGIK3WWL76E57BBTJGAK http://www.dhss.delaware.gov/dhss/ - {"warcFileOffset":2964,"warcFilename":"ARCHIVEIT-1303-WEEKLY-JOB165158-20150717223222113-00000.warc.gz"}
-        self.logger.info("{} {} {} {} {} size={} {} {} {} offset={}".format(
-            recorded_url.client_ip, recorded_url.status, recorded_url.method,
-            recorded_url.url.decode("utf-8"), recorded_url.mimetype,
-            recorded_url.size, payload_digest, records[0].type.decode("utf-8"),
-            records[0].warc_filename, records[0].offset))
-
-    def _final_tasks(self, recorded_url, records):
-        if self.listeners:
-            for listener in self.listeners:
+    def _in_blackout(self, recorded_url):
+        """If --blackout-period=N (sec) is set, check if duplicate record
+        datetime is close to the original. If yes, we don't write it to WARC.
+        The aim is to avoid having unnecessary `revisit` records.
+        Return Boolean
+        """
+        if self.blackout_period and hasattr(recorded_url, "dedup_info") and \
+                recorded_url.dedup_info:
+            dedup_date = recorded_url.dedup_info.get('date')
+            if dedup_date and recorded_url.dedup_info.get('url') == recorded_url.url:
                 try:
-                    listener.notify(recorded_url, records)
-                except:
-                    self.logger.error('%s raised exception',
-                                      listener.notify, exc_info=True)
-        self._log(recorded_url, records)
+                    dt = datetime.strptime(dedup_date.decode('utf-8'),
+                                           '%Y-%m-%dT%H:%M:%SZ')
+                    return (datetime.utcnow() - dt).total_seconds() <= self.blackout_period
+                except ValueError:
+                    return False
+        return False
+
+    def _log(self, recorded_url, records):
+        # 2015-07-17T22:32:23.672Z     1         58 dns:www.dhss.delaware.gov P http://www.dhss.delaware.gov/dhss/ text/dns #045 20150717223214881+316 sha1:63UTPB7GTWIHAGIK3WWL76E57BBTJGAK http://www.dhss.delaware.gov/dhss/ - {"warcFileOffset":2964,"warcFilename":"ARCHIVEIT-1303-WEEKLY-JOB165158-20150717223222113-00000.warc.gz"}
+        try:
+            payload_digest = records[0].get_header(b'WARC-Payload-Digest').decode('utf-8')
+        except:
+            payload_digest = '-'
+        type_ = records[0].type.decode('utf-8') if records else '-'
+        filename = records[0].warc_filename if records else '-'
+        offset = records[0].offset if records else '-'
+        self.logger.info(
+                '%s %s %s %s %s size=%s %s %s %s offset=%s',
+                recorded_url.client_ip, recorded_url.status,
+                recorded_url.method, recorded_url.url.decode('utf-8'),
+                recorded_url.mimetype, recorded_url.size, payload_digest,
+                type_, filename, offset)
+
+    def _shutdown(self):
+        self.writer_pool.close_writers()
+
